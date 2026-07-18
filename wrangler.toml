@@ -1,0 +1,8 @@
+name = "etti-radio-backend"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "etti-radio-db"
+database_id = "e4236488-475c-440c-ad14-b55d6094e7e1"
