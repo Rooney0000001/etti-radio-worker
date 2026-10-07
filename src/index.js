@@ -155,7 +155,7 @@ export default {
 
       if (path === '/api/shows' && method === 'POST') {
         const body = await request.json();
-        const { day, dayOrder, startTime, endTime, title, host, description, password } = body;
+        const { day, dayOrder, startTime, endTime, title, host, coHost, description, password } = body;
 
         if (password !== env.ADMIN_PASSWORD) {
           return json({ error: 'Wrong password' }, 401);
@@ -165,10 +165,10 @@ export default {
         }
 
         const result = await env.DB.prepare(
-          'INSERT INTO shows (day, day_order, start_time, end_time, title, host, description) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          'INSERT INTO shows (day, day_order, start_time, end_time, title, host, co_host, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
           day.trim(), dayOrder || 0, startTime.trim(), (endTime || '').trim(),
-          title.trim(), (host || '').trim(), (description || '').trim()
+          title.trim(), (host || '').trim(), (coHost || '').trim(), (description || '').trim()
         ).run();
 
         return json({ success: true, id: result.meta.last_row_id });
@@ -181,10 +181,10 @@ export default {
           return json({ error: 'Wrong password' }, 401);
         }
         await env.DB.prepare(
-          'UPDATE shows SET day = ?, day_order = ?, start_time = ?, end_time = ?, title = ?, host = ?, description = ? WHERE id = ?'
+          'UPDATE shows SET day = ?, day_order = ?, start_time = ?, end_time = ?, title = ?, host = ?, co_host = ?, description = ? WHERE id = ?'
         ).bind(
           body.day.trim(), body.dayOrder || 0, body.startTime.trim(), (body.endTime || '').trim(),
-          body.title.trim(), (body.host || '').trim(), (body.description || '').trim(), showIdMatch[1]
+          body.title.trim(), (body.host || '').trim(), (body.coHost || '').trim(), (body.description || '').trim(), showIdMatch[1]
         ).run();
         return json({ success: true });
       }
