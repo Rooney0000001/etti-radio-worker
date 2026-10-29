@@ -1,0 +1,370 @@
+// ============================================
+// ETTI RADIO — CLOUDFLARE WORKER BACKEND
+// ============================================
+// Handles: live stream link, manual blog posts, and the video archive
+// (auto-filled whenever a broadcast ends). Uses D1 (SQLite) for storage.
+// ============================================
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+  });
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    if (method === 'OPTIONS') {
+      return new Response(null, { headers: CORS_HEADERS });
+    }
+
+    try {
+      // ---------- Live status ----------
+      if (path === '/api/live' && method === 'GET') {
+        const row = await env.DB.prepare('SELECT live_url, updated_at FROM live_status WHERE id = 1').first();
+        return json({ liveUrl: row?.live_url || '', updatedAt: row?.updated_at || null });
+      }
+
+      if (path === '/api/live' && method === 'POST') {
+        const body = await request.json();
+        const { liveUrl, password } = body;
+
+        if (password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+
+        const current = await env.DB.prepare('SELECT live_url FROM live_status WHERE id = 1').first();
+        const newUrl = (liveUrl || '').trim();
+
+        // If ending a broadcast (newUrl empty) and there was a live link,
+        // automatically archive it as a video
+        if (newUrl === '' && current?.live_url) {
+          await env.DB.prepare(
+            'INSERT INTO videos (title, video_url) VALUES (?, ?)'
+          ).bind('Broadcast ' + new Date().toLocaleDateString(), current.live_url).run();
+        }
+
+        await env.DB.prepare(
+          'UPDATE live_status SET live_url = ?, updated_at = datetime("now") WHERE id = 1'
+        ).bind(newUrl).run();
+
+        return json({ success: true, liveUrl: newUrl });
+      }
+
+      // ---------- Blog posts ----------
+      // ---------- RSS Feed ----------
+      // ---------- Per-post share preview (for WhatsApp/Facebook link previews) ----------
+      const postShareMatch = path.match(/^\/post\/(\d+)$/);
+      if (postShareMatch && method === 'GET') {
+        const post = await env.DB.prepare('SELECT * FROM posts WHERE id = ?').bind(postShareMatch[1]).first();
+
+        const siteUrl = 'https://ettiradio.vercel.app';
+        const workerUrl = 'https://etti-radio-backend.rooneywonder90.workers.dev';
+
+        if (!post) {
+          return new Response('Post not found', { status: 404, headers: CORS_HEADERS });
+        }
+
+        function escapeHtmlAttr(str){
+          return (str || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        const excerpt = (post.content || '').slice(0, 160);
+        const imageUrl = post.image_url
+          ? workerUrl + '/post-image/' + post.id
+          : siteUrl + '/logo.jpg';
+        const redirectUrl = siteUrl + '/?post=' + post.id + '#blog';
+
+        const html = '<!DOCTYPE html><html><head>' +
+          '<meta charset="UTF-8">' +
+          '<title>' + escapeHtmlAttr(post.title) + '</title>' +
+          '<meta property="og:title" content="' + escapeHtmlAttr(post.title) + '">' +
+          '<meta property="og:description" content="' + escapeHtmlAttr(excerpt) + '">' +
+          '<meta property="og:image" content="' + imageUrl + '">' +
+          '<meta property="og:type" content="article">' +
+          '<meta property="og:url" content="' + workerUrl + '/post/' + post.id + '">' +
+          '<meta name="twitter:card" content="summary_large_image">' +
+          '<meta name="twitter:title" content="' + escapeHtmlAttr(post.title) + '">' +
+          '<meta name="twitter:description" content="' + escapeHtmlAttr(excerpt) + '">' +
+          '<meta name="twitter:image" content="' + imageUrl + '">' +
+          '<meta http-equiv="refresh" content="0;url=' + redirectUrl + '">' +
+          '</head><body>' +
+          '<p>Redirecting to <a href="' + redirectUrl + '">' + escapeHtmlAttr(post.title) + '</a>...</p>' +
+          '<script>window.location.replace(' + JSON.stringify(redirectUrl) + ');</script>' +
+          '</body></html>';
+
+        return new Response(html, {
+          headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS }
+        });
+      }
+
+      // ---------- Serve a post's photo as a real image URL (needed since it's stored as base64) ----------
+      const postImageMatch = path.match(/^\/post-image\/(\d+)$/);
+      if (postImageMatch && method === 'GET') {
+        const post = await env.DB.prepare('SELECT image_url FROM posts WHERE id = ?').bind(postImageMatch[1]).first();
+
+        if (!post || !post.image_url || !post.image_url.startsWith('data:')) {
+          return new Response('No image', { status: 404, headers: CORS_HEADERS });
+        }
+
+        const match = post.image_url.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
+        if (!match) {
+          return new Response('Invalid image data', { status: 500, headers: CORS_HEADERS });
+        }
+
+        const contentType = match[1];
+        const binary = atob(match[2]);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+        return new Response(bytes, {
+          headers: { 'Content-Type': contentType, 'Cache-Control': 'public, max-age=86400', ...CORS_HEADERS }
+        });
+      }
+
+      if (path === '/rss.xml' && method === 'GET') {
+        const { results } = await env.DB.prepare(
+          'SELECT * FROM posts ORDER BY created_at DESC LIMIT 30'
+        ).all();
+
+        const siteUrl = 'https://ettiradio.vercel.app';
+
+        function escapeXml(str){
+          return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        const items = results.map(function(p){
+          const pubDate = new Date(p.created_at + 'Z').toUTCString();
+          return '<item>' +
+            '<title>' + escapeXml(p.title) + '</title>' +
+            '<link>' + siteUrl + '/#blog</link>' +
+            '<description>' + escapeXml(p.content.slice(0, 300)) + '</description>' +
+            (p.author ? '<author>' + escapeXml(p.author) + '</author>' : '') +
+            '<pubDate>' + pubDate + '</pubDate>' +
+            '<guid isPermaLink="false">post-' + p.id + '</guid>' +
+          '</item>';
+        }).join('');
+
+        const rss = '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<rss version="2.0"><channel>' +
+          '<title>ETTI Radio & TV — News</title>' +
+          '<link>' + siteUrl + '</link>' +
+          '<description>Editorial coverage and station updates from the ETTI Radio & TV newsroom.</description>' +
+          '<language>en-ke</language>' +
+          items +
+          '</channel></rss>';
+
+        return new Response(rss, {
+          headers: { 'Content-Type': 'application/rss+xml; charset=utf-8', ...CORS_HEADERS }
+        });
+      }
+
+      if (path === '/api/posts' && method === 'GET') {
+        const { results } = await env.DB.prepare(
+          'SELECT * FROM posts ORDER BY created_at DESC LIMIT 100'
+        ).all();
+        return json({ posts: results });
+      }
+
+      if (path === '/api/posts' && method === 'POST') {
+        const body = await request.json();
+        const { title, content, imageUrl, author, password } = body;
+
+        if (password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        if (!title || !content) {
+          return json({ error: 'Title and content are required' }, 400);
+        }
+
+        const result = await env.DB.prepare(
+          'INSERT INTO posts (title, content, image_url, author) VALUES (?, ?, ?, ?)'
+        ).bind(title.trim(), content.trim(), (imageUrl || '').trim(), (author || '').trim()).run();
+
+        return json({ success: true, id: result.meta.last_row_id });
+      }
+
+      const postIdMatch = path.match(/^\/api\/posts\/(\d+)$/);
+      if (postIdMatch && method === 'DELETE') {
+        const body = await request.json();
+        if (body.password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        await env.DB.prepare('DELETE FROM posts WHERE id = ?').bind(postIdMatch[1]).run();
+        return json({ success: true });
+      }
+
+      if (postIdMatch && method === 'PUT') {
+        const body = await request.json();
+        if (body.password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        await env.DB.prepare(
+          'UPDATE posts SET title = ?, content = ?, image_url = ?, author = ? WHERE id = ?'
+        ).bind(body.title.trim(), body.content.trim(), (body.imageUrl || '').trim(), (body.author || '').trim(), postIdMatch[1]).run();
+        return json({ success: true });
+      }
+
+      // ---------- Video archive ----------
+      if (path === '/api/videos' && method === 'GET') {
+        const { results } = await env.DB.prepare(
+          'SELECT * FROM videos ORDER BY created_at DESC LIMIT 100'
+        ).all();
+        return json({ videos: results });
+      }
+
+      // Manual add, in case a producer wants to add an older video too
+      if (path === '/api/videos' && method === 'POST') {
+        const body = await request.json();
+        const { title, videoUrl, password } = body;
+
+        if (password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        if (!videoUrl) {
+          return json({ error: 'Video URL is required' }, 400);
+        }
+
+        const result = await env.DB.prepare(
+          'INSERT INTO videos (title, video_url) VALUES (?, ?)'
+        ).bind((title || '').trim(), videoUrl.trim()).run();
+
+        return json({ success: true, id: result.meta.last_row_id });
+      }
+
+      const videoIdMatch = path.match(/^\/api\/videos\/(\d+)$/);
+      if (videoIdMatch && method === 'DELETE') {
+        const body = await request.json();
+        if (body.password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        await env.DB.prepare('DELETE FROM videos WHERE id = ?').bind(videoIdMatch[1]).run();
+        return json({ success: true });
+      }
+
+      // ---------- Program Lineup (shows) ----------
+      if (path === '/api/shows' && method === 'GET') {
+        const { results } = await env.DB.prepare(
+          'SELECT * FROM shows ORDER BY day_order ASC, start_time ASC'
+        ).all();
+        return json({ shows: results });
+      }
+
+      if (path === '/api/shows' && method === 'POST') {
+        const body = await request.json();
+        const { day, dayOrder, startTime, endTime, title, host, coHost, description, password } = body;
+
+        if (password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        if (!day || !startTime || !title) {
+          return json({ error: 'Day, start time, and show title are required' }, 400);
+        }
+
+        const result = await env.DB.prepare(
+          'INSERT INTO shows (day, day_order, start_time, end_time, title, host, co_host, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(
+          day.trim(), dayOrder || 0, startTime.trim(), (endTime || '').trim(),
+          title.trim(), (host || '').trim(), (coHost || '').trim(), (description || '').trim()
+        ).run();
+
+        return json({ success: true, id: result.meta.last_row_id });
+      }
+
+      const showIdMatch = path.match(/^\/api\/shows\/(\d+)$/);
+      if (showIdMatch && method === 'PUT') {
+        const body = await request.json();
+        if (body.password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        await env.DB.prepare(
+          'UPDATE shows SET day = ?, day_order = ?, start_time = ?, end_time = ?, title = ?, host = ?, co_host = ?, description = ? WHERE id = ?'
+        ).bind(
+          body.day.trim(), body.dayOrder || 0, body.startTime.trim(), (body.endTime || '').trim(),
+          body.title.trim(), (body.host || '').trim(), (body.coHost || '').trim(), (body.description || '').trim(), showIdMatch[1]
+        ).run();
+        return json({ success: true });
+      }
+
+      if (showIdMatch && method === 'DELETE') {
+        const body = await request.json();
+        if (body.password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        await env.DB.prepare('DELETE FROM shows WHERE id = ?').bind(showIdMatch[1]).run();
+        return json({ success: true });
+      }
+
+      // ---------- Team ----------
+      if (path === '/api/team' && method === 'GET') {
+        const { results } = await env.DB.prepare(
+          'SELECT * FROM team ORDER BY created_at ASC'
+        ).all();
+        return json({ team: results });
+      }
+
+      if (path === '/api/team' && method === 'POST') {
+        const body = await request.json();
+        const { name, role, bio, photoUrl, showLink, password } = body;
+
+        if (password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        if (!name || !role) {
+          return json({ error: 'Name and role are required' }, 400);
+        }
+
+        const result = await env.DB.prepare(
+          'INSERT INTO team (name, role, bio, photo_url, show_link) VALUES (?, ?, ?, ?, ?)'
+        ).bind(
+          name.trim(), role.trim(), (bio || '').trim(), (photoUrl || '').trim(), (showLink || '').trim()
+        ).run();
+
+        return json({ success: true, id: result.meta.last_row_id });
+      }
+
+      const teamIdMatch = path.match(/^\/api\/team\/(\d+)$/);
+      if (teamIdMatch && method === 'PUT') {
+        const body = await request.json();
+        if (body.password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        await env.DB.prepare(
+          'UPDATE team SET name = ?, role = ?, bio = ?, photo_url = ?, show_link = ? WHERE id = ?'
+        ).bind(
+          body.name.trim(), body.role.trim(), (body.bio || '').trim(),
+          (body.photoUrl || '').trim(), (body.showLink || '').trim(), teamIdMatch[1]
+        ).run();
+        return json({ success: true });
+      }
+
+      if (teamIdMatch && method === 'DELETE') {
+        const body = await request.json();
+        if (body.password !== env.ADMIN_PASSWORD) {
+          return json({ error: 'Wrong password' }, 401);
+        }
+        await env.DB.prepare('DELETE FROM team WHERE id = ?').bind(teamIdMatch[1]).run();
+        return json({ success: true });
+      }
+
+      if (path === '/' || path === '') {
+        return new Response('ETTI Radio Worker backend is running.', { headers: CORS_HEADERS });
+      }
+
+      return json({ error: 'Not found' }, 404);
+
+    } catch (err) {
+      return json({ error: 'Server error: ' + err.message }, 500);
+    }
+  },
+};
